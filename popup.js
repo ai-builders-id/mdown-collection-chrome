@@ -1,148 +1,188 @@
-// ============================================================
-// mdown-dropper — popup.js
-// Fetches file list from GitHub API, renders draggable items,
-// and injects content into the active tab via content.js
-// ============================================================
+// mdown-dropper v3 — popup.js
+// File list 100% dari GitHub API, zero hard-code
 
-const REPO_OWNER = 'ai-builders-id';
-const REPO_NAME  = 'mdown-collection';
-const RAW_BASE   = `https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/main/`;
-const API_BASE   = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/git/trees/main?recursive=1`;
-const CACHE_KEY  = 'mdown_filelist_cache';
-const CACHE_TTL  = 10 * 60 * 1000; // 10 minutes
-
-// Short human-readable descriptions for numbered files
-const FILE_DESCRIPTIONS = {
-  '00_PROJECT_CHARTER':            'Vision, scope, success criteria',
-  '01_PRD':                        'Product requirements',
-  '02_BRD':                        'Business requirements',
-  '03_FRD':                        'Functional requirements',
-  '04_TRD':                        'Technical requirements',
-  '05_ARCHITECTURE':               'System architecture',
-  '06_IMPLEMENTATION_PLAN':        'Build plan & phases',
-  '07_MASTER_CHECKLIST':           'Release readiness checklist',
-  '08_ROADMAP':                    'Roadmap',
-  '09_OPEN_SOURCE_STANDARD':       'OSS posture',
-  '10_RISK_REGISTER':              'Risk tracking',
-  '11_DECISIONS':                  'Decision log (ADR-style)',
-  '12_TEST_STRATEGY':              'Test strategy',
-  '13_GLOSSARY':                   'Domain glossary',
-  '14_SECURITY_THREAT_MODEL':      'Threat model',
-  '15_PROTOCOL_DRAFT':             'IPC / daemon protocol',
-  '16_CONFIG_REFERENCE':           'Config file reference',
-  '17_DEVELOPER_SETUP':            'Dev environment setup',
-  '18_INSTALLATION':               'End-user install guide',
-  '19_REQUIREMENTS_TRACEABILITY':  'Traceability matrix',
-  '20_UI_ADAPTATION':              'Adapting another product UI',
-  '21_UI_FEATURE_PARITY_CHECKLIST':'UI parity checklist',
-  '22_UI_STATE_PROTOCOL_CONTRACT': 'UI ↔ daemon state contract',
-  '23_UI_DESIGN_SYSTEM':           'UI design system',
-  '24_CONTRIBUTOR_SKILLS':         'Skills matrix for contributors',
-  '25_MEMORY_CONCEPT':             'Agent memory model',
-  '26_AVATAR_ENGINE':              'Avatar rendering engine',
-  '27_WORKSPACE_ARCHITECTURE':     'Multi-workspace agent runtime',
-  '28_PLATFORM_BASELINE':          'OS / runtime baseline',
-  '29_PROTOCOL_FREEZE':            'Protocol stability policy',
-  '30_STABLE_CLI':                 'CLI stability contract',
-  '31_STORAGE_FORMAT':             'On-disk storage format',
-  'BLUEPRINT':                     'High-level shape of the system',
-  'KNOWN_LIMITATIONS':             'Known limitations',
-  'README':                        'Repository overview',
-  'TEMPLATE_GUIDE':                'Full placeholder reference',
-  'progress':                      'Progress tracker JSON',
+// ── Repo config — satu-satunya yang boleh di-hardcode ────
+const REPOS = {
+  prd: {
+    owner: 'ai-builders-id',
+    repo:  'prd-prompt-collection',
+    label: 'PRD Prompt',
+    icon:  '📋',
+    color: '#3fb950',
+    filter: item => item.type === 'blob'
+                 && item.path.endsWith('.md')
+                 && item.path !== 'README.md',
+    githubUrl: 'https://github.com/ai-builders-id/prd-prompt-collection',
+  },
+  mdown: {
+    owner: 'ai-builders-id',
+    repo:  'mdown-collection',
+    label: 'Prompt Collection',
+    icon:  '🗂️',
+    color: '#58a6ff',
+    filter: item => item.type === 'blob'
+                 && (item.path.endsWith('.md') || item.path.endsWith('.json'))
+                 && !item.path.startsWith('assets/'),
+    githubUrl: 'https://github.com/ai-builders-id/mdown-collection',
+  },
 };
 
-// Group labels for subfolders
-const FOLDER_ICONS = {
-  '':          '📄',
-  'minimal':   '🗂️',
-  'standards': '📐',
+const CACHE_TTL = 10 * 60 * 1000; // 10 menit
+
+// ── Search Aliases ────────────────────────────────────────
+const SEARCH_ALIASES = {
+  'cs': 'customer support',
+  'prd': 'product requirements',
+  'qa': 'quality assurance',
+  'api': 'application programming interface',
 };
 
-let allFiles = [];
-let filtered = [];
+// ── State ─────────────────────────────────────────────────
+let activeRepo   = 'prd';  // 'prd' | 'mdown'
+let allFiles     = [];
+let filtered     = [];
+let currentPath  = null;
+let currentRepo  = null;
+let rawContent   = '';
+let varValues    = {};
+let activeTab    = 'rendered';
+let editingVar   = null;
+const contentCache = new Map(); // prefetch cache for drag
 
-// ── DOM refs ──────────────────────────────────────────────
-const mainContent  = document.getElementById('mainContent');
-const searchInput  = document.getElementById('searchInput');
-const footerCount  = document.getElementById('footerCount');
-const refreshBtn   = document.getElementById('refreshBtn');
+// ── DOM ───────────────────────────────────────────────────
+const viewList        = document.getElementById('viewList');
+const viewPreview     = document.getElementById('viewPreview');
+const listScroll      = document.getElementById('listScroll');
+const searchInput     = document.getElementById('searchInput');
+const footerCount     = document.getElementById('footerCount');
+const footerLink      = document.getElementById('footerLink');
+const refreshBtn      = document.getElementById('refreshBtn');
+const repoTabMdown    = document.getElementById('repoTabMdown');
+const repoTabPrd      = document.getElementById('repoTabPrd');
+const hintDot         = document.getElementById('hintDot');
 
-// ── Helpers ───────────────────────────────────────────────
-function stemName(filename) {
-  return filename.replace(/\.md$/, '').replace(/\.json$/, '');
+const backBtn         = document.getElementById('backBtn');
+const previewFilename = document.getElementById('previewFilename');
+const tabRendered     = document.getElementById('tabRendered');
+const tabRaw          = document.getElementById('tabRaw');
+const varsBar         = document.getElementById('varsBar');
+const varsChips       = document.getElementById('varsChips');
+const previewScroll   = document.getElementById('previewScroll');
+const pfDrag          = document.getElementById('pfDrag');
+const pfCopy          = document.getElementById('pfCopy');
+const pfInsert        = document.getElementById('pfInsert');
+const varModal        = document.getElementById('varModal');
+const vmVarName       = document.getElementById('vmVarName');
+const vmInput         = document.getElementById('vmInput');
+const vmCancel        = document.getElementById('vmCancel');
+const vmApply         = document.getElementById('vmApply');
+
+// ── GitHub API ────────────────────────────────────────────
+function cacheKey(repoKey) { return `mdown_v3_${repoKey}`; }
+function rawBase(cfg) { return `https://raw.githubusercontent.com/${cfg.owner}/${cfg.repo}/main/`; }
+function apiUrl(cfg)  { return `https://api.github.com/repos/${cfg.owner}/${cfg.repo}/git/trees/main?recursive=1`; }
+
+async function fetchFileList(repoKey, force = false) {
+  const cfg = REPOS[repoKey];
+  const key = cacheKey(repoKey);
+
+  if (!force) {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw) {
+        const c = JSON.parse(raw);
+        if (Date.now() - c.ts < CACHE_TTL) return c.files;
+      }
+    } catch (_) {}
+  }
+
+  const res = await fetch(apiUrl(cfg), { headers: { Accept: 'application/vnd.github+json' } });
+  if (!res.ok) throw new Error(`GitHub API ${res.status} — ${cfg.repo}`);
+  const data = await res.json();
+
+  const files = data.tree
+    .filter(cfg.filter)
+    .map(item => ({ path: item.path, size: item.size }));
+
+  localStorage.setItem(key, JSON.stringify({ ts: Date.now(), files }));
+  return files;
 }
 
-function getDesc(filename) {
-  const stem = stemName(filename);
-  return FILE_DESCRIPTIONS[stem] || '';
+async function fetchContent(repoKey, path) {
+  const cfg = REPOS[repoKey];
+  const res = await fetch(rawBase(cfg) + path);
+  if (!res.ok) throw new Error(`Gagal fetch ${path}`);
+  return await res.text();
 }
 
-function getFileIcon(path) {
+// ── File display helpers (semua derived dari path, zero hard-code) ─
+function getFilename(path) { return path.split('/').pop(); }
+
+function getDisplayName(path) {
+  const fname = getFilename(path);
+  const stem  = fname.replace(/\.md$|\.json$/, '');
+  // "PRD - Accounting" → sudah bagus
+  // "00_PROJECT_CHARTER" → "00. PROJECT CHARTER" → kita split angka
+  return stem.replace(/_/g, ' ');
+}
+
+function getNumberPrefix(path) {
+  const stem = getFilename(path).replace(/\.md$|\.json$/, '');
+  const m = stem.match(/^(\d+)[_-]/);
+  return m ? m[1] : null;
+}
+
+function getNameWithoutNumber(path) {
+  const stem = getFilename(path).replace(/\.md$|\.json$/, '');
+  return stem.replace(/^\d+[_-]/, '').replace(/_/g, ' ');
+}
+
+function getFileIcon(path, repoKey) {
   if (path.endsWith('.json')) return '{}';
+  if (repoKey === 'prd') {
+    if (path.toLowerCase().includes('template')) return '📐';
+    return '📋';
+  }
   if (path.startsWith('standards/')) return '📐';
   if (path.startsWith('minimal/'))  return '🗂️';
   return '📄';
 }
 
+function getFolderKey(path) {
+  const parts = path.split('/');
+  return parts.length > 1 ? parts.slice(0, -1).join('/') : '';
+}
+
+function getFolderLabel(folderKey, repoKey) {
+  if (!folderKey) return repoKey === 'prd' ? 'PRD Collection' : 'Root';
+  if (folderKey === 'standards') return 'Engineering Standards';
+  if (folderKey === 'minimal')   return 'Minimal Templates';
+  return folderKey;
+}
+
 function groupFiles(files) {
-  const groups = {};
+  const g = {};
   files.forEach(f => {
-    const parts = f.path.split('/');
-    const folder = parts.length > 1 ? parts.slice(0, -1).join('/') : '';
-    if (!groups[folder]) groups[folder] = [];
-    groups[folder].push(f);
+    const k = getFolderKey(f.path);
+    if (!g[k]) g[k] = [];
+    g[k].push(f);
   });
-  return groups;
+  return g;
 }
 
-function folderLabel(key) {
-  if (!key) return 'Root';
-  if (key === 'standards') return 'Engineering Standards';
-  if (key === 'minimal') return 'Minimal Templates';
-  if (key.startsWith('assets')) return null; // skip assets
-  return key;
+function formatSize(bytes) {
+  if (!bytes) return '';
+  if (bytes < 1024) return `${bytes}B`;
+  return `${(bytes / 1024).toFixed(1)}KB`;
 }
 
-// ── Fetch file list ───────────────────────────────────────
-async function fetchFileList(forceRefresh = false) {
-  if (!forceRefresh) {
-    try {
-      const raw = localStorage.getItem(CACHE_KEY);
-      if (raw) {
-        const cache = JSON.parse(raw);
-        if (Date.now() - cache.ts < CACHE_TTL) return cache.files;
-      }
-    } catch (_) {}
-  }
-
-  const res = await fetch(API_BASE, {
-    headers: { Accept: 'application/vnd.github+json' }
-  });
-
-  if (!res.ok) throw new Error(`GitHub API error: ${res.status}`);
-  const data = await res.json();
-
-  const files = data.tree
-    .filter(item => item.type === 'blob' && (item.path.endsWith('.md') || item.path.endsWith('.json')))
-    .filter(item => !item.path.startsWith('assets/'))
-    .map(item => ({ path: item.path, sha: item.sha }));
-
-  localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), files }));
-  return files;
-}
-
-// ── Fetch raw content for a file ──────────────────────────
-async function fetchContent(path) {
-  const res = await fetch(RAW_BASE + path);
-  if (!res.ok) throw new Error(`Failed to fetch ${path}`);
-  return await res.text();
-}
-
-// ── Render ────────────────────────────────────────────────
+// ── Render list ───────────────────────────────────────────
 function renderList(files) {
+  const repoKey = activeRepo;
+  footerLink.href = REPOS[repoKey].githubUrl;
+
   if (!files.length) {
-    mainContent.innerHTML = `<div class="no-results">Tidak ada file yang cocok 🔍</div>`;
+    listScroll.innerHTML = `<div class="no-results">Tidak ada file yang cocok 🔍</div>`;
     footerCount.textContent = '0 files';
     return;
   }
@@ -152,139 +192,342 @@ function renderList(files) {
   const groups = groupFiles(files);
   const html = [];
 
-  const orderedKeys = Object.keys(groups).sort((a, b) => {
-    if (!a) return -1;
-    if (!b) return 1;
-    return a.localeCompare(b);
-  });
+  Object.keys(groups)
+    .sort((a, b) => !a ? -1 : !b ? 1 : a.localeCompare(b))
+    .forEach(folderKey => {
+      const label = getFolderLabel(folderKey, repoKey);
+      html.push(`<div class="section-label">${label}</div>`);
 
-  orderedKeys.forEach(folder => {
-    const label = folderLabel(folder);
-    if (label === null) return;
+      groups[folderKey].forEach(file => {
+        const icon   = getFileIcon(file.path, repoKey);
+        const num    = getNumberPrefix(file.path);
+        const name   = getNameWithoutNumber(file.path);
+        const size   = formatSize(file.size);
+        const numHtml = num ? `<span class="file-num">${num}.</span>` : '';
 
-    html.push(`<div class="section-label">${label}</div>`);
-
-    groups[folder].forEach(file => {
-      const filename = file.path.split('/').pop();
-      const stem     = stemName(filename);
-      const desc     = getDesc(filename);
-      const icon     = getFileIcon(file.path);
-
-      // Extract leading number for display
-      const numMatch = stem.match(/^(\d+)_/);
-      const numPart  = numMatch ? `<span class="file-number">${numMatch[1]}.</span>` : '';
-      const namePart = stem.replace(/^\d+_/, '').replace(/_/g, ' ');
-
-      html.push(`
-        <div class="file-item"
-             draggable="true"
-             data-path="${file.path}"
-             data-name="${filename}"
-             title="Drag ke halaman web, atau klik kanan untuk copy">
-          <span class="file-icon">${icon}</span>
-          <div class="file-info">
-            <div class="file-name">${numPart}${namePart}</div>
-            ${desc ? `<div class="file-desc">${desc}</div>` : ''}
-          </div>
-          <button class="copy-btn" data-path="${file.path}" title="Copy konten">Copy</button>
-          <span class="drag-handle">⠿</span>
-        </div>
-      `);
+        html.push(`
+          <div class="file-item" draggable="true" data-path="${file.path}" data-repo="${repoKey}">
+            <span class="file-icon">${icon}</span>
+            <div class="file-info">
+              <div class="file-name">${numHtml}${name}</div>
+              ${size ? `<div class="file-desc">${size}</div>` : ''}
+            </div>
+            <div class="row-btns">
+              <button class="row-btn preview-btn" data-path="${file.path}" data-repo="${repoKey}" title="Preview">👁</button>
+              <button class="row-btn green copy-row-btn" data-path="${file.path}" data-repo="${repoKey}" title="Copy">Copy</button>
+            </div>
+            <span class="drag-handle">⠿</span>
+          </div>`);
+      });
     });
-  });
 
-  mainContent.innerHTML = html.join('');
-  attachEvents();
+  listScroll.innerHTML = html.join('');
+  attachListEvents();
 }
 
-// ── Event Listeners ───────────────────────────────────────
-function attachEvents() {
-  // DRAG START
-  document.querySelectorAll('.file-item').forEach(item => {
-    item.addEventListener('dragstart', async (e) => {
-      const path = item.dataset.path;
-      item.classList.add('dragging');
+// ── List events ───────────────────────────────────────────
+function prefetchContent(repoKey, path) {
+  const key = `${repoKey}:${path}`;
+  if (contentCache.has(key)) return;
+  contentCache.set(key, null); // mark as in-flight
+  fetchContent(repoKey, path)
+    .then(c => contentCache.set(key, c))
+    .catch(() => contentCache.delete(key));
+}
 
-      // Immediately set text/plain so drag works everywhere
-      e.dataTransfer.setData('text/plain', `[Loading ${path}...]`);
+function attachListEvents() {
+  document.querySelectorAll('.file-item').forEach(item => {
+    const { path, repo } = item.dataset;
+    const cacheKey = `${repo}:${path}`;
+
+    // Prefetch on hover so content is ready before drag
+    item.addEventListener('mouseenter', () => prefetchContent(repo, path));
+    item.addEventListener('pointerdown', () => prefetchContent(repo, path));
+
+    item.addEventListener('dragstart', e => {
+      item.classList.add('dragging');
       e.dataTransfer.effectAllowed = 'copy';
 
-      // Fetch content async and store for drop
-      try {
-        const content = await fetchContent(path);
-        // Store in sessionStorage keyed by path for content.js to read
-        sessionStorage.setItem('mdown_drag_content', content);
-        sessionStorage.setItem('mdown_drag_path', path);
-        // Also update dataTransfer if still dragging (may not work in all browsers)
-        e.dataTransfer.setData('text/plain', content);
-      } catch (err) {
-        console.warn('Could not prefetch content:', err);
+      const cached = contentCache.get(cacheKey);
+      if (cached) {
+        // Content is ready — set it synchronously (same as preview drag)
+        e.dataTransfer.setData('text/plain', cached);
+        chrome.storage.local.set({ mdown_drag_content: cached, mdown_drag_ready: true, mdown_drag_path: path });
+      } else {
+        // Not yet cached — set placeholder, fetch async as fallback
+        e.dataTransfer.setData('text/plain', `{{LOADING:${path}}}`);
+        fetchContent(repo, path)
+          .then(content => {
+            contentCache.set(cacheKey, content);
+            chrome.storage.local.set({ mdown_drag_content: content, mdown_drag_ready: true, mdown_drag_path: path });
+          })
+          .catch(err => console.warn(err));
       }
     });
-
-    item.addEventListener('dragend', () => {
-      item.classList.remove('dragging');
-    });
+    item.addEventListener('dragend', () => item.classList.remove('dragging'));
   });
 
-  // COPY BUTTON
-  document.querySelectorAll('.copy-btn').forEach(btn => {
-    btn.addEventListener('click', async (e) => {
+  document.querySelectorAll('.preview-btn').forEach(btn => {
+    btn.addEventListener('click', e => { e.stopPropagation(); openPreview(btn.dataset.repo, btn.dataset.path); });
+  });
+
+  document.querySelectorAll('.copy-row-btn').forEach(btn => {
+    btn.addEventListener('click', async e => {
       e.stopPropagation();
-      const path = btn.dataset.path;
+      const { path, repo } = btn.dataset;
       btn.textContent = '...';
       try {
-        const content = await fetchContent(path);
-        await navigator.clipboard.writeText(content);
-        btn.textContent = '✓';
-        btn.classList.add('copied');
-        setTimeout(() => {
-          btn.textContent = 'Copy';
-          btn.classList.remove('copied');
-        }, 1500);
-      } catch (err) {
-        btn.textContent = '✗';
-        setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
-      }
+        const c = await fetchContent(repo, path);
+        await navigator.clipboard.writeText(c);
+        btn.textContent = '✓'; btn.classList.add('copied');
+        setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
+      } catch (_) { btn.textContent = '✗'; setTimeout(() => { btn.textContent = 'Copy'; }, 1500); }
     });
   });
+}
+
+// ── Repo tab switching ────────────────────────────────────
+repoTabMdown.addEventListener('click', () => switchRepo('mdown'));
+repoTabPrd.addEventListener('click',   () => switchRepo('prd'));
+
+async function switchRepo(key) {
+  if (activeRepo === key) return;
+  activeRepo = key;
+  searchInput.value = '';
+
+  repoTabMdown.classList.toggle('active', key === 'mdown');
+  repoTabPrd.classList.toggle('active',   key === 'prd');
+
+  const cfg = REPOS[key];
+  hintDot.style.background = cfg.color;
+  footerLink.href = cfg.githubUrl;
+
+  await loadRepo(key);
+}
+
+async function loadRepo(key, force = false) {
+  listScroll.innerHTML = `<div class="state-wrap"><div class="spinner"></div><div class="state-text">Mengambil dari GitHub...</div></div>`;
+  footerCount.textContent = '—';
+  try {
+    allFiles = await fetchFileList(key, force);
+    filtered = allFiles;
+    renderList(filtered);
+  } catch (err) {
+    listScroll.innerHTML = `<div class="state-wrap"><div class="state-icon">⚠️</div><div class="state-text">Gagal: ${err.message}</div></div>`;
+    footerCount.textContent = 'Error';
+  }
 }
 
 // ── Search ────────────────────────────────────────────────
 searchInput.addEventListener('input', () => {
-  const q = searchInput.value.trim().toLowerCase();
-  filtered = q
-    ? allFiles.filter(f => f.path.toLowerCase().includes(q))
-    : allFiles;
+  const rawQ = searchInput.value.trim().toLowerCase();
+  if (!rawQ) {
+    filtered = allFiles;
+  } else {
+    // Similarity match: check aliases first
+    const expandedQ = SEARCH_ALIASES[rawQ] || rawQ;
+    filtered = allFiles.filter(f => {
+      const path = f.path.toLowerCase();
+      // Match path, or match expanded query
+      return path.includes(rawQ) || path.includes(expandedQ);
+    });
+  }
   renderList(filtered);
 });
 
 // ── Refresh ───────────────────────────────────────────────
 refreshBtn.addEventListener('click', () => {
-  localStorage.removeItem(CACHE_KEY);
-  init(true);
+  localStorage.removeItem(cacheKey(activeRepo));
+  loadRepo(activeRepo, true);
 });
 
-// ── Init ─────────────────────────────────────────────────
-async function init(forceRefresh = false) {
-  mainContent.innerHTML = `
-    <div class="state-wrap">
-      <div class="spinner"></div>
-      <div class="state-text">${forceRefresh ? 'Memperbarui dari GitHub...' : 'Mengambil daftar file...'}</div>
-    </div>`;
+// ── Preview ───────────────────────────────────────────────
+async function openPreview(repoKey, path) {
+  currentPath = path;
+  currentRepo = repoKey;
+  varValues   = {};
+  activeTab   = 'rendered';
+  tabRendered.classList.add('active');
+  tabRaw.classList.remove('active');
+
+  viewList.classList.remove('active');
+  viewPreview.classList.add('active');
+
+  previewFilename.textContent = getDisplayName(path);
+  previewScroll.innerHTML = `<div class="state-wrap"><div class="spinner"></div><div class="state-text">Loading...</div></div>`;
+  varsBar.classList.remove('has-vars');
 
   try {
-    allFiles = await fetchFileList(forceRefresh);
-    filtered = allFiles;
-    renderList(filtered);
+    rawContent = await fetchContent(repoKey, path);
+    renderPreview();
   } catch (err) {
-    mainContent.innerHTML = `
-      <div class="state-wrap">
-        <div class="state-icon">⚠️</div>
-        <div class="state-text">Gagal memuat: ${err.message}<br><br>Periksa koneksi internet.</div>
-      </div>`;
-    footerCount.textContent = 'Error';
+    previewScroll.innerHTML = `<div class="state-wrap"><div class="state-icon">⚠️</div><div class="state-text">${err.message}</div></div>`;
   }
 }
 
-init();
+backBtn.addEventListener('click', () => {
+  viewPreview.classList.remove('active');
+  viewList.classList.add('active');
+  currentPath = null; rawContent = ''; varValues = {};
+});
+
+// ── Variable helpers ──────────────────────────────────────
+function extractVars(text) {
+  const matches = text.match(/\{\{([A-Z0-9_]+)\}\}/g) || [];
+  return [...new Set(matches.map(m => m.replace(/[{}]/g, '')))];
+}
+
+function applyVars(text) {
+  let out = text;
+  for (const [k, v] of Object.entries(varValues)) {
+    if (v) out = out.replaceAll(`{{${k}}}`, v);
+  }
+  return out;
+}
+
+// ── Markdown renderer ─────────────────────────────────────
+function renderMarkdown(md) {
+  return md
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/```[\w]*\n([\s\S]*?)```/g, (_, c) => `<pre><code>${c.trimEnd()}</code></pre>`)
+    .replace(/^### (.+)$/gm,'<h3>$1</h3>')
+    .replace(/^## (.+)$/gm,'<h2>$1</h2>')
+    .replace(/^# (.+)$/gm,'<h1>$1</h1>')
+    .replace(/\*\*\*(.+?)\*\*\*/g,'<strong><em>$1</em></strong>')
+    .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g,'<em>$1</em>')
+    .replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/^&gt; (.+)$/gm,'<blockquote>$1</blockquote>')
+    .replace(/^---+$/gm,'<hr/>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2" target="_blank">$1</a>')
+    .replace(/^\s*[-*] (.+)$/gm,'<li>$1</li>')
+    .replace(/^\s*\d+\. (.+)$/gm,'<li>$1</li>')
+    .replace(/^\|(.+)\|$/gm,(_, row) => {
+      const cells = row.split('|').map(c => c.trim()).filter(c => c && !c.match(/^[-:]+$/));
+      if (!cells.length) return '';
+      return `<tr>${cells.map(c => `<td>${c}</td>`).join('')}</tr>`;
+    })
+    .replace(/^([^<\n].+)$/gm,'<p>$1</p>')
+    .replace(/(<li>.*<\/li>\n?)+/gs, m => `<ul>${m}</ul>`)
+    .replace(/(<tr>.*<\/tr>\n?)+/gs, m => `<table><tbody>${m}</tbody></table>`)
+    .replace(/\n/g,'');
+}
+
+function renderPreview() {
+  const vars    = extractVars(rawContent);
+  const content = applyVars(rawContent);
+
+  // Vars bar
+  if (vars.length) {
+    varsBar.classList.add('has-vars');
+    varsChips.innerHTML = vars.map(v =>
+      `<span class="var-chip" data-var="${v}">{{${v}}}</span>`
+    ).join('');
+    varsChips.querySelectorAll('.var-chip').forEach(c =>
+      c.addEventListener('click', () => openVarModal(c.dataset.var))
+    );
+  } else {
+    varsBar.classList.remove('has-vars');
+    varsChips.innerHTML = '';
+  }
+
+  if (activeTab === 'rendered') {
+    let html = renderMarkdown(content);
+    // highlight remaining unfilled vars in rendered view
+    vars.forEach(v => {
+      const re = new RegExp(`\\{\\{${v}\\}\\}`, 'g');
+      html = html.replace(re, `<span class="var-rendered" data-var="${v}">{{${v}}}</span>`);
+    });
+    previewScroll.innerHTML = `<div class="md-body">${html}</div>`;
+  } else {
+    // raw: escape then highlight vars
+    let escaped = rawContent.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    vars.forEach(v => {
+      const re = new RegExp(`\\{\\{${v}\\}\\}`, 'g');
+      escaped = escaped.replace(re, `<span class="var-highlight" data-var="${v}">{{${v}}}</span>`);
+    });
+    previewScroll.innerHTML = `<div class="raw-body">${escaped}</div>`;
+  }
+
+  previewScroll.querySelectorAll('[data-var]').forEach(el =>
+    el.addEventListener('click', () => openVarModal(el.dataset.var))
+  );
+}
+
+// ── Tab switching ─────────────────────────────────────────
+tabRendered.addEventListener('click', () => {
+  activeTab = 'rendered';
+  tabRendered.classList.add('active'); tabRaw.classList.remove('active');
+  renderPreview();
+});
+tabRaw.addEventListener('click', () => {
+  activeTab = 'raw';
+  tabRaw.classList.add('active'); tabRendered.classList.remove('active');
+  renderPreview();
+});
+
+// ── Var modal ─────────────────────────────────────────────
+function openVarModal(varName) {
+  editingVar = varName;
+  vmVarName.textContent = `{{${varName}}}`;
+  vmInput.value = varValues[varName] || '';
+  varModal.classList.add('open');
+  setTimeout(() => vmInput.focus(), 50);
+}
+function closeVarModal() { varModal.classList.remove('open'); editingVar = null; }
+vmCancel.addEventListener('click', closeVarModal);
+varModal.addEventListener('click', e => { if (e.target === varModal) closeVarModal(); });
+vmApply.addEventListener('click', () => {
+  if (!editingVar) return;
+  varValues[editingVar] = vmInput.value.trim();
+  closeVarModal();
+  renderPreview();
+});
+vmInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') vmApply.click();
+  if (e.key === 'Escape') closeVarModal();
+});
+
+// ── Preview footer actions ────────────────────────────────
+function getFinalContent() { return applyVars(rawContent); }
+
+pfDrag.addEventListener('dragstart', e => {
+  const content = getFinalContent();
+  e.dataTransfer.setData('text/plain', content);
+  e.dataTransfer.effectAllowed = 'copy';
+  chrome.storage.local.set({ mdown_drag_content: content, mdown_drag_ready: true });
+});
+
+pfCopy.addEventListener('click', async () => {
+  await navigator.clipboard.writeText(getFinalContent());
+  pfCopy.textContent = '✓ Copied!';
+  setTimeout(() => { pfCopy.textContent = '📋 Copy'; }, 1500);
+});
+
+pfInsert.addEventListener('click', () => {
+  const content = getFinalContent();
+  chrome.tabs.query({ active: true, currentWindow: true }, tabs => {
+    chrome.scripting.executeScript({
+      target: { tabId: tabs[0].id },
+      func: (c) => {
+        const el = document.activeElement;
+        if (!el) { alert('Klik dulu field yang ingin diisi.'); return; }
+        if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+          const s = el.selectionStart || 0, e = el.selectionEnd || 0;
+          el.value = el.value.slice(0, s) + c + el.value.slice(e);
+          el.selectionStart = el.selectionEnd = s + c.length;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        } else if (el.isContentEditable) {
+          document.execCommand('insertText', false, c);
+        } else { alert('Klik dulu textarea/input yang ingin diisi.'); }
+      },
+      args: [content]
+    });
+  });
+});
+
+// ── Init ─────────────────────────────────────────────────
+hintDot.style.background = REPOS[activeRepo].color;
+footerLink.href = REPOS[activeRepo].githubUrl;
+loadRepo(activeRepo);

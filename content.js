@@ -1,148 +1,103 @@
-// ============================================================
-// mdown-dropper — content.js
-// Injected into every page. Listens for drops on
-// text inputs / textareas / contenteditable elements
-// and pastes the markdown content.
-// ============================================================
+// mdown-dropper v2 — content.js
+// Handles drop events on any page using chrome.storage for content transfer
 
-(function () {
-  if (window.__mdownDropperInjected) return;
-  window.__mdownDropperInjected = true;
+(function(){
+  if(window.__mdownDropperV2) return;
+  window.__mdownDropperV2 = true;
 
   let dropOverlay = null;
-  let isDraggingMdown = false;
 
-  // ── Visual drop overlay ───────────────────────────────
-  function createOverlay(el) {
+  function isDropTarget(el){
+    if(!el) return false;
+    const tag = el.tagName;
+    if(tag==='TEXTAREA') return true;
+    if(tag==='INPUT' && ['text','search','url','email'].includes(el.type)) return true;
+    if(el.isContentEditable) return true;
+    return false;
+  }
+
+  function createOverlay(el){
     removeOverlay();
     const rect = el.getBoundingClientRect();
     dropOverlay = document.createElement('div');
     Object.assign(dropOverlay.style, {
-      position:      'fixed',
-      top:           `${rect.top}px`,
-      left:          `${rect.left}px`,
-      width:         `${rect.width}px`,
-      height:        `${rect.height}px`,
-      border:        '2px dashed #58a6ff',
-      borderRadius:  '6px',
-      background:    'rgba(88, 166, 255, 0.08)',
-      pointerEvents: 'none',
-      zIndex:        '2147483647',
-      transition:    'opacity 0.15s',
-      display:       'flex',
-      alignItems:    'center',
-      justifyContent:'center',
+      position:'fixed', top:`${rect.top}px`, left:`${rect.left}px`,
+      width:`${rect.width}px`, height:`${rect.height}px`,
+      border:'2px dashed #58a6ff', borderRadius:'6px',
+      background:'rgba(88,166,255,0.07)', pointerEvents:'none',
+      zIndex:'2147483647', display:'flex', alignItems:'center', justifyContent:'center'
     });
-
     const label = document.createElement('div');
     Object.assign(label.style, {
-      background:   'rgba(13, 17, 23, 0.85)',
-      color:        '#58a6ff',
-      borderRadius: '6px',
-      padding:      '4px 10px',
-      fontSize:     '12px',
-      fontFamily:   'monospace',
-      pointerEvents:'none',
+      background:'rgba(13,17,23,.85)', color:'#58a6ff', borderRadius:'5px',
+      padding:'3px 10px', fontSize:'12px', fontFamily:'monospace', pointerEvents:'none'
     });
     label.textContent = '📄 Drop markdown here';
     dropOverlay.appendChild(label);
     document.body.appendChild(dropOverlay);
   }
 
-  function removeOverlay() {
-    if (dropOverlay) {
-      dropOverlay.remove();
-      dropOverlay = null;
+  function removeOverlay(){ if(dropOverlay){ dropOverlay.remove(); dropOverlay=null; } }
+
+  function insertText(el, content){
+    if(el.tagName==='TEXTAREA'||el.tagName==='INPUT'){
+      const s=el.selectionStart||0, e=el.selectionEnd||0;
+      el.value=el.value.slice(0,s)+content+el.value.slice(e);
+      el.selectionStart=el.selectionEnd=s+content.length;
+      el.dispatchEvent(new Event('input',{bubbles:true}));
+      el.dispatchEvent(new Event('change',{bubbles:true}));
+    } else if(el.isContentEditable){
+      const sel=window.getSelection();
+      if(sel.rangeCount){
+        const range=sel.getRangeAt(0);
+        range.deleteContents();
+        const tn=document.createTextNode(content);
+        range.insertNode(tn);
+        range.setStartAfter(tn); range.collapse(true);
+        sel.removeAllRanges(); sel.addRange(range);
+      } else { el.textContent+=content; }
+      el.dispatchEvent(new InputEvent('input',{bubbles:true}));
     }
+    // Flash confirmation
+    const prev=el.style.outline;
+    el.style.outline='2px solid #3fb950';
+    setTimeout(()=>{ el.style.outline=prev; },700);
   }
 
-  // ── Target detection ──────────────────────────────────
-  function isDropTarget(el) {
-    if (!el) return false;
-    const tag = el.tagName;
-    if (tag === 'TEXTAREA') return true;
-    if (tag === 'INPUT' && ['text', 'search', 'url', 'email'].includes(el.type)) return true;
-    if (el.isContentEditable) return true;
-    return false;
-  }
-
-  // ── Get content from drag event ───────────────────────
-  async function getDropContent(e) {
-    // 1. Try dataTransfer text (works if fetched synchronously)
-    const dtText = e.dataTransfer.getData('text/plain');
-    if (dtText && !dtText.startsWith('[Loading ')) return dtText;
-
-    // 2. Fallback: fetch from GitHub directly using stored path
-    // (We use a broadcast channel or message to popup — but simplest
-    //  is to fetch the raw content using the stored path in the event)
-    // Actually we'll try to get from Chrome storage via message
-    return dtText || '';
-  }
-
-  // ── Global drag listeners ─────────────────────────────
-  document.addEventListener('dragover', (e) => {
-    const target = e.target;
-    if (isDropTarget(target)) {
+  document.addEventListener('dragover', e=>{
+    if(isDropTarget(e.target)){
       e.preventDefault();
-      e.dataTransfer.dropEffect = 'copy';
-      createOverlay(target);
+      e.dataTransfer.dropEffect='copy';
+      createOverlay(e.target);
     }
   }, true);
 
-  document.addEventListener('dragleave', (e) => {
-    const related = e.relatedTarget;
-    if (!related || !isDropTarget(related)) {
-      removeOverlay();
-    }
+  document.addEventListener('dragleave', e=>{
+    if(!e.relatedTarget||!isDropTarget(e.relatedTarget)) removeOverlay();
   }, true);
 
-  document.addEventListener('drop', async (e) => {
-    const target = e.target;
-    if (!isDropTarget(target)) return;
-
-    e.preventDefault();
-    e.stopPropagation();
+  document.addEventListener('drop', e=>{
+    const target=e.target;
+    if(!isDropTarget(target)) return;
+    e.preventDefault(); e.stopPropagation();
     removeOverlay();
 
-    const content = await getDropContent(e);
-    if (!content) return;
+    // Check plain text first (works if content was set synchronously, e.g. from preview drag)
+    const dtText = e.dataTransfer.getData('text/plain');
 
-    if (target.tagName === 'TEXTAREA' || target.tagName === 'INPUT') {
-      const start = target.selectionStart || 0;
-      const end   = target.selectionEnd   || 0;
-      const val   = target.value;
-      target.value = val.slice(0, start) + content + val.slice(end);
-      target.selectionStart = target.selectionEnd = start + content.length;
-      target.dispatchEvent(new Event('input', { bubbles: true }));
-      target.dispatchEvent(new Event('change', { bubbles: true }));
-    } else if (target.isContentEditable) {
-      const sel = window.getSelection();
-      if (sel.rangeCount) {
-        const range = sel.getRangeAt(0);
-        range.deleteContents();
-        const textNode = document.createTextNode(content);
-        range.insertNode(textNode);
-        range.setStartAfter(textNode);
-        range.collapse(true);
-        sel.removeAllRanges();
-        sel.addRange(range);
-      } else {
-        target.textContent += content;
-      }
-      target.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    if(dtText && !dtText.startsWith('{{LOADING:')){
+      // Got real content directly
+      insertText(target, dtText);
+      return;
     }
 
-    // Brief flash to confirm drop
-    flashTarget(target);
+    // Content was fetched async — retrieve from chrome.storage
+    chrome.storage.local.get(['mdown_drag_content','mdown_drag_ready'], (result)=>{
+      if(result.mdown_drag_ready && result.mdown_drag_content){
+        insertText(target, result.mdown_drag_content);
+        chrome.storage.local.remove(['mdown_drag_content','mdown_drag_ready','mdown_drag_path']);
+      }
+    });
   }, true);
-
-  function flashTarget(el) {
-    const prev = el.style.outline;
-    el.style.outline = '2px solid #3fb950';
-    el.style.transition = 'outline 0.3s';
-    setTimeout(() => {
-      el.style.outline = prev;
-    }, 700);
-  }
 
 })();
