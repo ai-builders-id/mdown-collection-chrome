@@ -67,13 +67,14 @@ const tabRendered     = document.getElementById('tabRendered');
 const tabRaw          = document.getElementById('tabRaw');
 const varsBar         = document.getElementById('varsBar');
 const varsChips       = document.getElementById('varsChips');
+const varsLabelToggle = document.getElementById('varsLabelToggle');
+const varBadge        = document.getElementById('varBadge');
 const previewScroll   = document.getElementById('previewScroll');
 const pfDrag          = document.getElementById('pfDrag');
 const pfCopy          = document.getElementById('pfCopy');
 const pfInsert        = document.getElementById('pfInsert');
 const varModal        = document.getElementById('varModal');
-const vmVarName       = document.getElementById('vmVarName');
-const vmInput         = document.getElementById('vmInput');
+const vmBody          = document.getElementById('vmBody');
 const vmCancel        = document.getElementById('vmCancel');
 const vmApply         = document.getElementById('vmApply');
 
@@ -337,7 +338,9 @@ searchInput.addEventListener('input', () => {
 
 // ── Refresh ───────────────────────────────────────────────
 refreshBtn.addEventListener('click', () => {
-  localStorage.removeItem(cacheKey(activeRepo));
+  // Refresh KEDUA repo GitHub sekaligus
+  localStorage.removeItem(cacheKey('prd'));
+  localStorage.removeItem(cacheKey('mdown'));
   loadRepo(activeRepo, true);
 });
 
@@ -372,15 +375,44 @@ backBtn.addEventListener('click', () => {
 });
 
 // ── Variable helpers ──────────────────────────────────────
+// Extract ALL {{...}} patterns — apapun isinya (spasi, slash, tanda baca, dll)
 function extractVars(text) {
-  const matches = text.match(/\{\{([A-Z0-9_]+)\}\}/g) || [];
-  return [...new Set(matches.map(m => m.replace(/[{}]/g, '')))];
+  const matches = text.match(/\{\{([^}]+)\}\}/g) || [];
+  return [...new Set(matches.map(m => {
+    let name = m.replace(/[{}]/g, '').trim();
+    // Abaikan {{LOADING:...}} — itu khusus drag
+    if (name.startsWith('LOADING:')) return null;
+    return name;
+  }).filter(Boolean))];
 }
 
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Hitung berapa kali {{name}} muncul di text
+function countVar(text, name) {
+  const re = new RegExp(`\\{\\{${escapeRegex(name)}\\}\\}`, 'g');
+  return (text.match(re) || []).length;
+}
+
+// varValues[name] = array nilai per-kemunculan. Occurrence ke-i diisi vals[i];
+// yang kosong tetap dibiarkan sebagai {{name}}.
 function applyVars(text) {
   let out = text;
-  for (const [k, v] of Object.entries(varValues)) {
-    if (v) out = out.replaceAll(`{{${k}}}`, v);
+  for (const k of Object.keys(varValues)) {
+    const vals = varValues[k];
+    if (!Array.isArray(vals)) continue;
+    let i = 0;
+    const re = new RegExp(`\\{\\{${escapeRegex(k)}\\}\\}`, 'g');
+    out = out.replace(re, m => {
+      const v = vals[i++];
+      return (v !== undefined && v !== '') ? v : m;
+    });
   }
   return out;
 }
@@ -417,9 +449,11 @@ function renderPreview() {
   const vars    = extractVars(rawContent);
   const content = applyVars(rawContent);
 
-  // Vars bar
+  // Vars bar (collapsible dengan badge + toggle)
   if (vars.length) {
     varsBar.classList.add('has-vars');
+    varsBar.classList.add('collapsed'); // start collapsed
+    varBadge.textContent = vars.length;
     varsChips.innerHTML = vars.map(v =>
       `<span class="var-chip" data-var="${v}">{{${v}}}</span>`
     ).join('');
@@ -435,16 +469,16 @@ function renderPreview() {
     let html = renderMarkdown(content);
     // highlight remaining unfilled vars in rendered view
     vars.forEach(v => {
-      const re = new RegExp(`\\{\\{${v}\\}\\}`, 'g');
-      html = html.replace(re, `<span class="var-rendered" data-var="${v}">{{${v}}}</span>`);
+      const re = new RegExp(`\\{\\{${escapeRegex(v)}\\}\\}`, 'g');
+      html = html.replace(re, `<span class="var-rendered" data-var="${escapeHtml(v)}">{{${v}}}</span>`);
     });
     previewScroll.innerHTML = `<div class="md-body">${html}</div>`;
   } else {
     // raw: escape then highlight vars
     let escaped = rawContent.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     vars.forEach(v => {
-      const re = new RegExp(`\\{\\{${v}\\}\\}`, 'g');
-      escaped = escaped.replace(re, `<span class="var-highlight" data-var="${v}">{{${v}}}</span>`);
+      const re = new RegExp(`\\{\\{${escapeRegex(v)}\\}\\}`, 'g');
+      escaped = escaped.replace(re, `<span class="var-highlight" data-var="${escapeHtml(v)}">{{${v}}}</span>`);
     });
     previewScroll.innerHTML = `<div class="raw-body">${escaped}</div>`;
   }
@@ -466,26 +500,59 @@ tabRaw.addEventListener('click', () => {
   renderPreview();
 });
 
-// ── Var modal ─────────────────────────────────────────────
+// ── Vars bar toggle (collapsible) ────────────────────────
+varsLabelToggle.addEventListener('click', () => {
+  varsBar.classList.toggle('collapsed');
+});
+
+// ── Var modal (single variable — klik {{a}} isi {{a}} aja) ──
 function openVarModal(varName) {
+  const count = countVar(rawContent, varName) || 1;
+  const vals  = Array.isArray(varValues[varName]) ? varValues[varName] : [];
+  const numbered = count > 1; // tampilkan nomor kalau muncul >1 kali
+
+  vmBody.innerHTML = Array.from({ length: count }, (_, i) => {
+    const val = vals[i] || '';
+    const tag = numbered ? ` <span class="vm-field-num">#${i + 1}</span>` : '';
+    return `<div class="vm-field">
+      <div class="vm-field-label">
+        <span class="vm-label-brackets">{{</span>${escapeHtml(varName)}<span class="vm-label-brackets">}}</span>${tag}
+      </div>
+      <input type="text" class="vm-field-input${val ? ' vm-filled' : ''}" data-idx="${i}" value="${escapeHtml(val)}" placeholder="Isi {{${escapeHtml(varName)}}}${numbered ? ' #' + (i + 1) : ''}..."/>
+    </div>`;
+  }).join('');
+
   editingVar = varName;
-  vmVarName.textContent = `{{${varName}}}`;
-  vmInput.value = varValues[varName] || '';
   varModal.classList.add('open');
-  setTimeout(() => vmInput.focus(), 50);
+  setTimeout(() => {
+    const input = vmBody.querySelector('.vm-field-input');
+    if (input) input.focus();
+  }, 80);
 }
-function closeVarModal() { varModal.classList.remove('open'); editingVar = null; }
+
+function closeVarModal() {
+  varModal.classList.remove('open');
+  editingVar = null;
+}
 vmCancel.addEventListener('click', closeVarModal);
 varModal.addEventListener('click', e => { if (e.target === varModal) closeVarModal(); });
+
 vmApply.addEventListener('click', () => {
-  if (!editingVar) return;
-  varValues[editingVar] = vmInput.value.trim();
+  if (editingVar) {
+    const inputs = [...vmBody.querySelectorAll('.vm-field-input')];
+    varValues[editingVar] = inputs.map(inp => inp.value.trim());
+  }
   closeVarModal();
   renderPreview();
 });
-vmInput.addEventListener('keydown', e => {
-  if (e.key === 'Enter') vmApply.click();
-  if (e.key === 'Escape') closeVarModal();
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && varModal.classList.contains('open') && varModal.contains(e.target)) {
+    vmApply.click();
+  }
+  if (e.key === 'Escape' && varModal.classList.contains('open')) {
+    closeVarModal();
+  }
 });
 
 // ── Preview footer actions ────────────────────────────────
