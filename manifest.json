@@ -2,12 +2,21 @@
   "manifest_version": 3,
   "name": "blinker",
   "description": "Quickly access and use markdown prompts and templates.",
-  "version": "2.0.1",
+  "version": "2.0.3",
   "action": {
-    "default_popup": "popup.html",
-    "default_icon": "icons/blinker.svg"
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
-  "permissions": ["activeTab", "scripting", "storage"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "panel.html"
+  },
+  "permissions": ["activeTab", "scripting", "storage", "sidePanel"],
   "host_permissions": [
     "https://api.github.com/*",
     "https://raw.githubusercontent.com/*",
@@ -25,4 +34,5 @@
     "128": "icons/icon128.png"
   }
 }
+
 
